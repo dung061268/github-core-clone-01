@@ -16,6 +16,11 @@
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
+// This entry's forge lives in app.ts and the modules it wires together (forge.ts, git.ts,
+// rest.ts, graphql.ts, mcp.ts): one shared in-memory store served over git smart HTTP,
+// REST v3, GraphQL and MCP. The lifecycle below is the harness's own and stays as the kit
+// shipped it; everything the suite scores is behind createApp().
+
 import { createApp } from './app.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');

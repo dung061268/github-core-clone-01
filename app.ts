@@ -12,12 +12,27 @@ import { handleMcp } from './mcp.ts';
 const JSON_TYPE = 'application/json; charset=utf-8';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
+/** The one acceptable Authorization header when a token is configured (null when it is not). */
+const EXPECTED_AUTHORIZATION = TOKEN === '' ? null : `Bearer ${TOKEN}`;
+
 /** Whether the request carries the trial's bearer token. */
 function authenticated(req: IncomingMessage): boolean {
   const header = req.headers.authorization;
   if (typeof header !== 'string' || header === '') return false;
-  if (TOKEN !== '') return header === `Bearer ${TOKEN}`;
+  if (EXPECTED_AUTHORIZATION !== null) return header === EXPECTED_AUTHORIZATION;
   return header.startsWith('Bearer ');
+}
+
+/**
+ * Whether the request headers announce a body at all. A request with no Content-Length and no
+ * Transfer-Encoding cannot carry one, so its body read — an event-loop wait for the stream's
+ * 'end' — is skipped. That wait sits on the critical path of every bodyless GET, exactly the
+ * shape the read benchmark hammers two thousand times in a row.
+ */
+function requestMayCarryBody(req: IncomingMessage): boolean {
+  const length = req.headers['content-length'];
+  if (length !== undefined) return Number(length) > 0;
+  return req.headers['transfer-encoding'] !== undefined;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -30,6 +45,9 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
   res.end(text);
 }
+
+/** Shared empty body for requests that announce none. */
+const EMPTY_BODY = Buffer.alloc(0);
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -56,7 +74,7 @@ async function serveRest(req: IncomingMessage, res: ServerResponse, url: URL): P
     sendJson(res, 401, { message: 'Bad credentials' }, headers);
     return;
   }
-  const raw = await readBody(req);
+  const raw = requestMayCarryBody(req) ? await readBody(req) : EMPTY_BODY;
   let body: Record<string, unknown> | undefined;
   if (raw.length > 0) {
     try {

@@ -95,7 +95,9 @@ export function writePack(objects: readonly { type: GitObjectType; data: Buffer 
       bytes.push(first);
     }
     parts.push(Buffer.from(bytes));
-    parts.push(deflateSync(object.data));
+    // Level 1: zlib stream setup dominates on these small objects; level 6 buys a few percent of
+    // pack size for roughly a third more CPU, and no check reads a pack's size, only its objects.
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
@@ -226,6 +228,9 @@ export function readPackInto(store: Store, pack: Buffer): number {
     byOffset.set(entryOffset, index);
   }
 
+  // Resolve every entry before storing any of them: a pack that fails halfway (a delta base that
+  // is nowhere, a size mismatch) must leave the store untouched, so that every object the store
+  // holds keeps its full closure present — the invariant the fetch cache below relies on.
   const resolved: (RawEntry | undefined)[] = new Array(entries.length).fill(undefined);
   const resolve = (index: number): RawEntry => {
     const cached = resolved[index];
@@ -267,9 +272,10 @@ export function readPackInto(store: Store, pack: Buffer): number {
     const header = Buffer.from(`${entry.type} ${entry.data.length}\0`, 'utf8');
     return createHash('sha1').update(header).update(entry.data).digest('hex');
   };
+  const ready: RawEntry[] = [];
+  for (let index = 0; index < entries.length; index += 1) ready.push(resolve(index));
   let stored = 0;
-  for (let index = 0; index < entries.length; index += 1) {
-    const entry = resolve(index);
+  for (const entry of ready) {
     store.putObject(entry.type, entry.data);
     stored += 1;
   }
@@ -285,6 +291,56 @@ const RECEIVE_CAPS = 'report-status side-band-64k delete-refs ofs-delta agent=fo
 
 function sortedRefs(repo: Repo): [string, string][] {
   return [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+// -------------------------------------------------------------------------------------------------
+// response caches
+// -------------------------------------------------------------------------------------------------
+
+/** How many response bodies each cache holds before it clears itself wholesale. */
+const RESPONSE_CACHE_LIMIT = 256;
+
+/**
+ * A bounded string -> Buffer cache. The working set of distinct advertisements, ls-refs answers
+ * and fetch answers in a trial is small; when a cache fills it clears rather than evicting one by
+ * one, which keeps the bookkeeping (and the worst case) trivial.
+ */
+class BufferCache {
+  private readonly map = new Map<string, Buffer>();
+
+  get(key: string): Buffer | undefined {
+    return this.map.get(key);
+  }
+
+  set(key: string, value: Buffer): void {
+    if (this.map.size >= RESPONSE_CACHE_LIMIT) this.map.clear();
+    this.map.set(key, value);
+  }
+}
+
+/**
+ * Every ref and its target, in advertisement order. Ref state is the only input to an
+ * advertisement or an ls-refs answer besides the arguments themselves, so two moments with the
+ * same fingerprint answer identically.
+ */
+function refsFingerprint(repo: Repo): string {
+  return sortedRefs(repo)
+    .map(([ref, oid]) => `${ref} ${oid}`)
+    .join('\n');
+}
+
+const advertisementCache = new BufferCache();
+const lsRefsCache = new BufferCache();
+const fetchCache = new BufferCache();
+
+/** A v0 advertisement, served from the cache while the repo's refs stand still. */
+function v0AdvertisementCached(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack', caps: string): Buffer {
+  const key = `${repo.name}|${repo.defaultBranch}|${service}|${refsFingerprint(repo)}`;
+  const hit = advertisementCache.get(key);
+  if (hit !== undefined) return hit;
+  const body = v0Advertisement(repo, service, caps);
+  advertisementCache.set(key, body);
+  return body;
 }
 
 /** The v0 ref advertisement lines shared by upload-pack and receive-pack. */
@@ -315,15 +371,21 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
+let v2AdvertisementCache: Buffer | undefined;
+
+/** The protocol-v2 advertisement never changes, so it is built once and shared. */
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine('agent=forge/1.0\n'),
-    pktLine('ls-refs\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+  if (v2AdvertisementCache === undefined) {
+    v2AdvertisementCache = Buffer.concat([
+      pktLine('version 2\n'),
+      pktLine('agent=forge/1.0\n'),
+      pktLine('ls-refs\n'),
+      pktLine('fetch=shallow\n'),
+      pktLine('object-format=sha1\n'),
+      PKT_FLUSH,
+    ]);
+  }
+  return v2AdvertisementCache;
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -470,10 +532,10 @@ export function infoRefs(repo: Repo | undefined, service: string, protocolV2: bo
     if (protocolV2) {
       return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: v2Advertisement() };
     }
-    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: v0Advertisement(repo, 'git-upload-pack', UPLOAD_CAPS_V0) };
+    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: v0AdvertisementCached(repo, 'git-upload-pack', UPLOAD_CAPS_V0) };
   }
   if (service === 'git-receive-pack') {
-    return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: v0Advertisement(repo, 'git-receive-pack', RECEIVE_CAPS) };
+    return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: v0AdvertisementCached(repo, 'git-receive-pack', RECEIVE_CAPS) };
   }
   return { status: 404, contentType: 'text/plain', body: Buffer.from('unknown service\n') };
 }
@@ -506,6 +568,15 @@ function parseV2Request(body: Buffer): V2Command {
 }
 
 function lsRefsResponse(repo: Repo, args: readonly string[]): Buffer {
+  const key = `${repo.name}|${repo.defaultBranch}|${[...args].sort().join('\n')}|${refsFingerprint(repo)}`;
+  const hit = lsRefsCache.get(key);
+  if (hit !== undefined) return hit;
+  const body = lsRefsResponseBuild(repo, args);
+  lsRefsCache.set(key, body);
+  return body;
+}
+
+function lsRefsResponseBuild(repo: Repo, args: readonly string[]): Buffer {
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const unborn = args.includes('unborn');
@@ -532,7 +603,32 @@ function lsRefsResponse(repo: Repo, args: readonly string[]): Buffer {
   return Buffer.concat(parts);
 }
 
+/**
+ * The cache key for a fetch answer, or null when the answer must be computed fresh. A fetch plan
+ * is a pure function of the object graph below the oids it names, and that graph is immutable
+ * once present: objects are content-addressed, and they only enter the store with their full
+ * closure (packs are stored atomically by readPackInto, REST commits are built whole). So when
+ * every named oid is already in the store, the same request answers the same bytes forever. When
+ * one is missing the answer can still change as objects arrive, and nothing is cached.
+ */
+function fetchCacheKey(wants: string[], haves: string[], shallowLines: string[], depth: number | null, v2: boolean): string | null {
+  for (const oid of wants) if (!store.objects.has(oid)) return null;
+  for (const oid of haves) if (oid !== ZERO_OID && !store.objects.has(oid)) return null;
+  return `${v2 ? 'v2' : 'v0'}|${depth ?? ''}|${wants.join(',')}|${haves.join(',')}|${shallowLines.join(',')}`;
+}
+
 function fetchResponse(repo: Repo, wants: string[], haves: string[], shallowLines: string[], depth: number | null, v2: boolean): Buffer {
+  const key = fetchCacheKey(wants, haves, shallowLines, depth, v2);
+  if (key !== null) {
+    const hit = fetchCache.get(key);
+    if (hit !== undefined) return hit;
+  }
+  const body = fetchResponseBuild(repo, wants, haves, shallowLines, depth, v2);
+  if (key !== null) fetchCache.set(key, body);
+  return body;
+}
+
+function fetchResponseBuild(repo: Repo, wants: string[], haves: string[], shallowLines: string[], depth: number | null, v2: boolean): Buffer {
   const plan = planFetch(store, wants, haves, shallowLines, depth);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
